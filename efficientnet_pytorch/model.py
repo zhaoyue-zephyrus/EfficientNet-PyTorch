@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torch.utils.checkpoint as cp
 
 from .utils import (
     relu_fn,
@@ -25,7 +26,7 @@ class MBConvBlock(nn.Module):
         has_se (bool): Whether the block contains a Squeeze and Excitation layer.
     """
 
-    def __init__(self, block_args, global_params):
+    def __init__(self, block_args, global_params, with_cp=False):
         super().__init__()
         self._block_args = block_args
         self._bn_mom = 1 - global_params.batch_norm_momentum
@@ -62,6 +63,8 @@ class MBConvBlock(nn.Module):
         self._project_conv = Conv2d(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
         self._bn2 = nn.BatchNorm2d(num_features=final_oup, momentum=self._bn_mom, eps=self._bn_eps)
 
+        self.with_cp = with_cp
+
     def forward(self, inputs, drop_connect_rate=None):
         """
         :param inputs: input tensor
@@ -69,26 +72,33 @@ class MBConvBlock(nn.Module):
         :return: output of block
         """
 
-        # Expansion and Depthwise Convolution
-        x = inputs
-        if self._block_args.expand_ratio != 1:
-            x = relu_fn(self._bn0(self._expand_conv(inputs)))
-        x = relu_fn(self._bn1(self._depthwise_conv(x)))
+        def _forward(inputs):
+            # Expansion and Depthwise Convolution
+            x = inputs
+            if self._block_args.expand_ratio != 1:
+                x = relu_fn(self._bn0(self._expand_conv(inputs)))
+            x = relu_fn(self._bn1(self._depthwise_conv(x)))
 
-        # Squeeze and Excitation
-        if self.has_se:
-            x_squeezed = F.adaptive_avg_pool2d(x, 1)
-            x_squeezed = self._se_expand(relu_fn(self._se_reduce(x_squeezed)))
-            x = torch.sigmoid(x_squeezed) * x
+            # Squeeze and Excitation
+            if self.has_se:
+                x_squeezed = F.adaptive_avg_pool2d(x, 1)
+                x_squeezed = self._se_expand(relu_fn(self._se_reduce(x_squeezed)))
+                x = torch.sigmoid(x_squeezed) * x
 
-        x = self._bn2(self._project_conv(x))
+            x = self._bn2(self._project_conv(x))
 
-        # Skip connection and drop connect
-        input_filters, output_filters = self._block_args.input_filters, self._block_args.output_filters
-        if self.id_skip and self._block_args.stride == 1 and input_filters == output_filters:
-            if drop_connect_rate:
-                x = drop_connect(x, p=drop_connect_rate, training=self.training)
-            x = x + inputs  # skip connection
+            # Skip connection and drop connect
+            input_filters, output_filters = self._block_args.input_filters, self._block_args.output_filters
+            if self.id_skip and self._block_args.stride == 1 and input_filters == output_filters:
+                if drop_connect_rate:
+                    x = drop_connect(x, p=drop_connect_rate, training=self.training)
+                x = x + inputs  # skip connection
+            return x
+
+        if self.with_cp and inputs.requires_grad:
+            x = cp.checkpoint(_forward, inputs)
+        else:
+            x = _forward(inputs)
         return x
 
 
@@ -105,7 +115,7 @@ class EfficientNet(nn.Module):
 
     """
 
-    def __init__(self, blocks_args=None, global_params=None):
+    def __init__(self, blocks_args=None, global_params=None, with_cp=False):
         super().__init__()
         assert isinstance(blocks_args, list), 'blocks_args should be a list'
         assert len(blocks_args) > 0, 'block args must be greater than 0'
@@ -137,11 +147,11 @@ class EfficientNet(nn.Module):
             )
 
             # The first block needs to take care of stride and filter size increase.
-            self._blocks.append(MBConvBlock(block_args, self._global_params))
+            self._blocks.append(MBConvBlock(block_args, self._global_params, with_cp=with_cp))
             if block_args.num_repeat > 1:
                 block_args = block_args._replace(input_filters=block_args.output_filters, stride=1)
             for _ in range(block_args.num_repeat - 1):
-                self._blocks.append(MBConvBlock(block_args, self._global_params))
+                self._blocks.append(MBConvBlock(block_args, self._global_params, with_cp=with_cp))
 
         # Head
         in_channels = block_args.output_filters  # output of final block
@@ -185,14 +195,14 @@ class EfficientNet(nn.Module):
         return x
 
     @classmethod
-    def from_name(cls, model_name, override_params=None):
+    def from_name(cls, model_name, override_params=None, with_cp=False):
         cls._check_model_name_is_valid(model_name)
         blocks_args, global_params = get_model_params(model_name, override_params)
-        return EfficientNet(blocks_args, global_params)
+        return EfficientNet(blocks_args, global_params, with_cp=with_cp)
 
     @classmethod
-    def from_pretrained(cls, model_name, num_classes=1000):
-        model = EfficientNet.from_name(model_name, override_params={'num_classes': num_classes})
+    def from_pretrained(cls, model_name, num_classes=1000, with_cp=False):
+        model = EfficientNet.from_name(model_name, override_params={'num_classes': num_classes}, with_cp=with_cp)
         load_pretrained_weights(model, model_name, load_fc=(num_classes == 1000))
         return model
 
